@@ -15,41 +15,43 @@
 # =========
 
 import itertools
+import logging
+import os
+import sys
+import time
+from abc import ABC, abstractmethod
 from collections import deque
 from enum import Enum, auto
-from typing import Any, Dict, Optional, List, Tuple
-from abc import ABC, abstractmethod
 from functools import cache
-
-import sys
-import os
-import time
-import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 import torch
-from torch import nn
 import torch.distributed as dist
 import zmq
+from torch import nn
 
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.layers.afd_type import AFDPerspective
-
 from sglang.srt.layers.communicator import (
     CommunicateContext,
     CommunicateSummableTensorPairFn,
+    LayerCommunicator,
     ScatterMode,
 )
+from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils import BumpAllocator
+
 
 class AFDForwardStage(Enum):
     AFD_FORWARD_STAGE_A = auto()
     AFD_FORWARD_STAGE_F = auto()
 
+
 class AFDStageScheduleGenerator:
     Schedule = List[Tuple[AFDForwardStage, int, int]]
+
     @staticmethod
     def ffn_stage(num_layers: int, m_stage: int) -> Schedule:
         schedule = []
@@ -57,21 +59,21 @@ class AFDStageScheduleGenerator:
             schedule.append((AFDForwardStage.AFD_FORWARD_STAGE_A, l, m))
             schedule.append((AFDForwardStage.AFD_FORWARD_STAGE_F, l, m))
         return schedule
+
     @staticmethod
     def attn_stage(num_layers: int, m_stage: int) -> Schedule:
         schedule = []
         if num_layers == 1:
-            return (
-                [(AFDForwardStage.AFD_FORWARD_STAGE_A, 0, m) for m in range(m_stage)]
-                +
-                [(AFDForwardStage.AFD_FORWARD_STAGE_F, 0, m) for m in range(m_stage)]
-            )
+            return [
+                (AFDForwardStage.AFD_FORWARD_STAGE_A, 0, m) for m in range(m_stage)
+            ] + [(AFDForwardStage.AFD_FORWARD_STAGE_F, 0, m) for m in range(m_stage)]
         for l, m in itertools.product(range(num_layers + 1), range(m_stage)):
             if l > 0:
                 schedule.append((AFDForwardStage.AFD_FORWARD_STAGE_F, l - 1, m))
             if l < num_layers:
                 schedule.append((AFDForwardStage.AFD_FORWARD_STAGE_A, l, m))
         return schedule
+
 
 class FifoTensorCommunicator(ABC):
     @abstractmethod
@@ -82,18 +84,21 @@ class FifoTensorCommunicator(ABC):
     def send_tensor(self, x: torch.Tensor):
         raise NotImplementedError
 
+
 class ZMQSimpleTensorCommunicator(FifoTensorCommunicator):
     def __init__(self, afd_perspective: AFDPerspective):
         super().__init__()
         self.zmq_context = zmq.Context()
 
         self.start_lport = (
-            self.get_ffn_port() if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN
+            self.get_ffn_port()
+            if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN
             else self.get_attn_port()
         )
 
         self.start_dport = (
-            self.get_attn_port() if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN
+            self.get_attn_port()
+            if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN
             else self.get_ffn_port()
         )
 
@@ -137,6 +142,7 @@ class ZMQSimpleTensorCommunicator(FifoTensorCommunicator):
         socket = self.get_push_socket()
         socket.send_pyobj(x)
 
+
 class StepMeshTensorCache(object):
     def __init__(self):
         self.push_tensor = None
@@ -147,8 +153,9 @@ class StepMeshTensorCache(object):
 
         self.h = None
 
+
 def stepmesh_scheduler():
-    os.environ['DMLC_ROLE'] = 'scheduler'
+    os.environ["DMLC_ROLE"] = "scheduler"
 
     print("StepMesh scheduler: DMLC_PS_ROOT_URI=%s" % os.environ["DMLC_NODE_HOST"])
     import fserver_lib as f
@@ -161,6 +168,7 @@ def stepmesh_scheduler():
 
     f.stop()
 
+
 class StepMeshTensorCommunicator(FifoTensorCommunicator):
     def __init__(self, afd_perspective: AFDPerspective):
         self.perspective = afd_perspective
@@ -171,13 +179,13 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
 
         self.start_stepmesh_scheduler()
 
-        time.sleep(10) # wait scheduler
+        time.sleep(10)  # wait scheduler
 
-        logger.info("%s init..." % os.environ['DMLC_ROLE'])
+        logger.info("%s init..." % os.environ["DMLC_ROLE"])
         f.init()
-        logger.info("%s init done." % os.environ['DMLC_ROLE'])
+        logger.info("%s init done." % os.environ["DMLC_ROLE"])
 
-        self.worker_num = int(os.environ['DMLC_NUM_WORKER'])
+        self.worker_num = int(os.environ["DMLC_NUM_WORKER"])
 
         self.key = 0
         self.gpu = torch.cuda.current_device()
@@ -216,34 +224,34 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
     def start_stepmesh_scheduler(self):
         self.get_node_ip()
 
-        gpu = '%s' % torch.cuda.current_device()
+        gpu = "%s" % torch.cuda.current_device()
 
-        self.env_def('DMLC_NODE_RANK',    '0')
-        self.env_def('DMLC_NUM_SERVER',   '1')
-        self.env_def('DMLC_NUM_WORKER',   '1')
-        self.env_def('DMLC_GROUP_SIZE',   '1')
-        self.env_def('DMLC_PS_ROOT_PORT', '8123')
-        self.env_def('DMLC_ENABLE_RDMA',  'ibverbs')
-        self.env_def('STEPMESH_GPU',      gpu)
+        self.env_def("DMLC_NODE_RANK", "0")
+        self.env_def("DMLC_NUM_SERVER", "1")
+        self.env_def("DMLC_NUM_WORKER", "1")
+        self.env_def("DMLC_GROUP_SIZE", "1")
+        self.env_def("DMLC_PS_ROOT_PORT", "8123")
+        self.env_def("DMLC_ENABLE_RDMA", "ibverbs")
+        self.env_def("STEPMESH_GPU", gpu)
 
         if afd_is_attn():
-            os.environ['DMLC_ROLE'] = 'worker'
+            os.environ["DMLC_ROLE"] = "worker"
         else:
-            os.environ['DMLC_ROLE'] = 'server'
+            os.environ["DMLC_ROLE"] = "server"
 
-        if os.environ['DMLC_ROLE'] != 'worker':
+        if os.environ["DMLC_ROLE"] != "worker":
             return
 
-        if os.environ.get('DMLC_NODE_RANK') != '0':
+        if os.environ.get("DMLC_NODE_RANK") != "0":
             return
 
-        if os.environ['STEPMESH_GPU'] != '0':
+        if os.environ["STEPMESH_GPU"] != "0":
             return
 
-        if os.environ.get('STEPMESH_SCHEDULER_STARTED') == '1':
+        if os.environ.get("STEPMESH_SCHEDULER_STARTED") == "1":
             return
 
-        os.environ['STEPMESH_SCHEDULER_STARTED'] = '1'
+        os.environ["STEPMESH_SCHEDULER_STARTED"] = "1"
         os.environ["DMLC_PS_ROOT_URI"] = os.environ["DMLC_NODE_HOST"]
 
         import multiprocessing
@@ -276,10 +284,8 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
         t.push_tensor.copy_(x)
 
         h = self.f.push_pull(
-                [t.push_tensor],
-                [t.push_key],
-                [t.pull_tensor],
-                [t.pull_key])
+            [t.push_tensor], [t.push_key], [t.pull_tensor], [t.pull_key]
+        )
 
         t.h = h
 
@@ -345,6 +351,7 @@ class StepMeshTensorCommunicator(FifoTensorCommunicator):
         else:
             self.ffn_send(x)
 
+
 @cache
 def get_tensor_communicator() -> FifoTensorCommunicator:
     afd_perspective = get_afd_perspective()
@@ -356,19 +363,24 @@ def get_tensor_communicator() -> FifoTensorCommunicator:
     else:
         raise NotImplementedError
 
+
 def get_afd_mirco_batch() -> int:
     afd_mirco_batch = global_server_args_dict.get("afd_mirco_batch")
     return afd_mirco_batch
+
 
 def get_afd_perspective() -> Optional[AFDPerspective]:
     afd_perspective = global_server_args_dict.get("afd_perspective")
     return afd_perspective
 
+
 def afd_is_ffn():
     return get_afd_perspective() == AFDPerspective.AFD_PERSPECTIVE_FFN
 
+
 def afd_is_attn():
     return get_afd_perspective() == AFDPerspective.AFD_PERSPECTIVE_ATTN
+
 
 def model_forward_afd_split_inputs(
     layers,
@@ -383,7 +395,7 @@ def model_forward_afd_split_inputs(
         residual: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        ) -> List[Dict]:
+    ) -> List[Dict]:
         return [
             dict(
                 **_model_forward_filter_inputs(
@@ -456,6 +468,7 @@ def model_forward_afd_split_inputs(
 
     return [_post_transform(**inputs) for inputs in inputs_arr]
 
+
 def model_forward_afd(
     layers,
     positions: torch.Tensor,
@@ -473,7 +486,7 @@ def model_forward_afd(
         residual=residual,
         positions=positions,
         forward_batch=forward_batch,
-        input_data_scatter_mode=input_data_scatter_mode
+        input_data_scatter_mode=input_data_scatter_mode,
     )
 
     stage_outputs: Dict[AFDForwardStage, deque[dict[Any, Any]]] = {
@@ -492,10 +505,11 @@ def model_forward_afd(
             inputs_args["residual"],
         )
         stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_A].append(
-            dict (
-            hidden_states = hidden_states,
-            residual = residual,
-        ))
+            dict(
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        )
 
     def forward_F(layer_id: int, mirco_batch_idx: int):
         inputs_args = stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_A].popleft()
@@ -505,14 +519,15 @@ def model_forward_afd(
             inputs_args["residual"],
         )
         stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_F].append(
-            dict (
-            hidden_states = hidden_states,
-            residual = residual,
-        ))
+            dict(
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        )
 
     stage_executors = {
-        AFDForwardStage.AFD_FORWARD_STAGE_A : forward_A,
-        AFDForwardStage.AFD_FORWARD_STAGE_F : forward_F,
+        AFDForwardStage.AFD_FORWARD_STAGE_A: forward_A,
+        AFDForwardStage.AFD_FORWARD_STAGE_F: forward_F,
     }
 
     pipeline_stages = (
@@ -526,9 +541,14 @@ def model_forward_afd(
         stage_executors.get(type)(*args)
 
     try:
-        results = [stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_F].popleft() for _ in range(m_stage)]
+        results = [
+            stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_F].popleft()
+            for _ in range(m_stage)
+        ]
     except IndexError:
-        raise ValueError("model_forward_afd: impossible path, a potential implementation bug?")
+        raise ValueError(
+            "model_forward_afd: impossible path, a potential implementation bug?"
+        )
 
     all_hidden_states, all_residual = zip(
         *((res["hidden_states"], res["residual"]) for res in results)
@@ -539,12 +559,113 @@ def model_forward_afd(
         torch.cat(all_residual, dim=0) if afd_is_attn() else None,
     )
 
+
+def deepseek_v2_forward_afd(
+    layers,
+    positions: torch.Tensor,
+    forward_batch: ForwardBatch,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    input_data_scatter_mode: ScatterMode,
+    zero_allocator: Optional[BumpAllocator] = None,
+):
+    num_layers = len(layers)
+    m_stage = get_afd_mirco_batch()
+
+    input_arrs = model_forward_afd_split_inputs(
+        layers=layers,
+        hidden_states=hidden_states,
+        residual=residual,
+        positions=positions,
+        forward_batch=forward_batch,
+        input_data_scatter_mode=input_data_scatter_mode,
+    )
+
+    stage_outputs: Dict[AFDForwardStage, deque[dict[Any, Any]]] = {
+        AFDForwardStage.AFD_FORWARD_STAGE_A: deque(),
+        AFDForwardStage.AFD_FORWARD_STAGE_F: deque(),
+    }
+
+    stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_F].extend(input_arrs)
+
+    def forward_A(layer_id: int, mirco_batch_idx: int):
+        inputs_args = stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_F].popleft()
+        hidden_states, residual = layers[layer_id].forward_afd_A(
+            input_arrs[mirco_batch_idx]["positions"],
+            inputs_args["hidden_states"],
+            input_arrs[mirco_batch_idx]["forward_batch"],
+            inputs_args["residual"],
+            zero_allocator,
+        )
+        stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_A].append(
+            dict(
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        )
+
+    def forward_F(layer_id: int, mirco_batch_idx: int):
+        inputs_args = stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_A].popleft()
+        hidden_states, residual = layers[layer_id].forward_afd_F(
+            inputs_args["hidden_states"],
+            input_arrs[mirco_batch_idx]["forward_batch"],
+            inputs_args["residual"],
+            zero_allocator,
+        )
+        stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_F].append(
+            dict(
+                hidden_states=hidden_states,
+                residual=residual,
+            )
+        )
+
+    stage_executors = {
+        AFDForwardStage.AFD_FORWARD_STAGE_A: forward_A,
+        AFDForwardStage.AFD_FORWARD_STAGE_F: forward_F,
+    }
+
+    pipeline_stages = (
+        AFDStageScheduleGenerator.attn_stage(num_layers, m_stage)
+        if afd_is_attn()
+        else AFDStageScheduleGenerator.ffn_stage(num_layers, m_stage)
+    )
+
+    for stage in pipeline_stages:
+        type, *args = stage
+        stage_executors.get(type)(*args)
+
+    try:
+        results = [
+            stage_outputs[AFDForwardStage.AFD_FORWARD_STAGE_F].popleft()
+            for _ in range(m_stage)
+        ]
+    except IndexError:
+        raise ValueError(
+            "model_forward_afd: impossible path, a potential implementation bug?"
+        )
+
+    all_hidden_states, all_residual = zip(
+        *((res["hidden_states"], res["residual"]) for res in results)
+    )
+
+    return (
+        torch.cat(all_hidden_states, dim=0),
+        torch.cat(all_residual, dim=0) if afd_is_attn() else None,
+    )
+
+
 class AFDCommunicator(LayerCommunicator):
-    def __init__(self, layer_communicator: LayerCommunicator, perspective: AFDPerspective, layer_id: int):
+    def __init__(
+        self,
+        layer_communicator: LayerCommunicator,
+        perspective: AFDPerspective,
+        layer_id: int,
+    ):
         self.perspective = perspective
         self.layer_communicator = layer_communicator
         self.layer_id = layer_id
         pass
+
     def prepare_attn(
         self,
         hidden_states: torch.Tensor,
@@ -555,7 +676,9 @@ class AFDCommunicator(LayerCommunicator):
         if self.perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
             return hidden_states, residual
 
-        return self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
+        return self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
 
     def prepare_mlp(
         self,
@@ -567,7 +690,9 @@ class AFDCommunicator(LayerCommunicator):
             hidden_states = get_tensor_communicator().recv_tensor()
             return hidden_states, residual
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(hidden_states, residual, forward_batch)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
         get_tensor_communicator().send_tensor(hidden_states)
 
         return hidden_states, residual
@@ -589,15 +714,19 @@ class AFDCommunicator(LayerCommunicator):
         )
         return hidden_states, residual
 
+
 class AFDProxyAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch) -> torch.Tensor:
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         return hidden_states
 
+
 class AFDProxyMLP(nn.Module):
-    def forward(self, hidden_states: torch.Tensor,
-                forward_batch: Optional[ForwardBatch] = None) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, forward_batch: Optional[ForwardBatch] = None
+    ) -> torch.Tensor:
         return hidden_states

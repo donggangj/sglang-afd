@@ -37,10 +37,19 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.afd import (
+    AFDCommunicator,
+    AFDProxyAttention,
+    AFDProxyMLP,
+    deepseek_v2_forward_afd,
+    get_afd_perspective,
+)
+from sglang.srt.layers.afd_type import AFDPerspective
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
@@ -1749,26 +1758,32 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
         self.is_nextn = is_nextn
-        self.self_attn = DeepseekV2AttentionMLA(
-            config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
-            kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            layer_id=layer_id,
-            reduce_results=False,
-            prefix=add_prefix("self_attn", prefix),
-            alt_stream=alt_stream,
-        )
+
+        afd_perspective = get_afd_perspective()
+
+        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
+            self.self_attn = AFDProxyAttention()
+        else:
+            self.self_attn = DeepseekV2AttentionMLA(
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=(
+                    config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+                ),
+                kv_lora_rank=config.kv_lora_rank,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                layer_id=layer_id,
+                reduce_results=False,
+                prefix=add_prefix("self_attn", prefix),
+                alt_stream=alt_stream,
+            )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
@@ -1780,7 +1795,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
         )
 
-        if self.is_layer_sparse:
+        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN:
+            self.mlp = AFDProxyMLP()
+        elif self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
                 config=config,
                 quant_config=quant_config,
@@ -1815,6 +1832,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
         )
 
+        if afd_perspective is not None:
+            self.layer_communicator = AFDCommunicator(
+                layer_communicator=self.layer_communicator,
+                perspective=afd_perspective,
+                layer_id=layer_id,
+            )
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         return is_nextn or (
             self.config.n_routed_experts is not None
@@ -1844,6 +1868,56 @@ class DeepseekV2DecoderLayer(nn.Module):
             return False
 
         return True
+
+    def forward_afd_A(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
+
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
+
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
+        )
+
+        return hidden_states, residual
+
+    def forward_afd_F(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        can_fuse_mlp_allreduce = (
+            self._should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+            and not (self.enable_dp_attention and self.speculative_algorithm.is_eagle())
+            and not self.is_nextn
+        )
+
+        hidden_states = self.mlp(hidden_states, forward_batch, can_fuse_mlp_allreduce)
+
+        if can_fuse_mlp_allreduce:
+            hidden_states._sglang_needs_allreduce_fusion = True
+
+        if not can_fuse_mlp_allreduce:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+
+        return hidden_states, residual
 
     def forward(
         self,
@@ -2017,31 +2091,46 @@ class DeepseekV2Model(nn.Module):
 
         residual = None
 
-        normal_num_layers = (
-            self.first_k_dense_replace
-            if forward_batch.can_run_tbo
-            else total_num_layers
-        )
-        for i in range(normal_num_layers):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
-                )
-
-        if normal_num_layers != total_num_layers:
-            hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers[normal_num_layers:],
-                enable_tbo=True,
+        if forward_batch.can_run_afd_overlap:
+            hidden_states, residual = deepseek_v2_forward_afd(
+                layers=self.layers,
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_num_layers - 1
-                ].layer_scatter_modes.layer_output_mode,
+                input_data_scatter_mode=ScatterMode.model_input_output(),
                 zero_allocator=zero_allocator,
             )
+        else:
+            normal_num_layers = (
+                self.first_k_dense_replace
+                if forward_batch.can_run_tbo
+                else total_num_layers
+            )
+            for i in range(normal_num_layers):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    layer = self.layers[i]
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                    )
+
+            if normal_num_layers != total_num_layers:
+                hidden_states, residual = model_forward_maybe_tbo(
+                    layers=self.layers[normal_num_layers:],
+                    enable_tbo=True,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    input_data_scatter_mode=self.layers[
+                        normal_num_layers - 1
+                    ].layer_scatter_modes.layer_output_mode,
+                    zero_allocator=zero_allocator,
+                )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -2371,6 +2460,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        afd_perspective = get_afd_perspective()
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -2385,26 +2475,33 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
+            stacked_params_mapping = []
+        else:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
 
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
-        )
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
-            expert_params_mapping += (
-                get_moe_impl_class().make_expert_input_scale_params_mapping(
-                    num_experts=self.config.n_routed_experts
-                )
+        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN:
+            expert_params_mapping = []
+        else:
+            # Params for weights, fp8 weight scales, fp8 activation scales
+            # (param_name, weight_name, expert_id, shard_id)
+            expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=self.config.n_routed_experts
+                + self.num_fused_shared_experts,
             )
+            if self.quant_config and self.quant_config.get_name() == "w4afp8":
+                expert_params_mapping += (
+                    get_moe_impl_class().make_expert_input_scale_params_mapping(
+                        num_experts=self.config.n_routed_experts
+                    )
+                )
 
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
