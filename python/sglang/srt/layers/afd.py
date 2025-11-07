@@ -671,13 +671,14 @@ class AFDCommunicator(LayerCommunicator):
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
+        qaunt_format: str = "",
     ):
         # just pass through
         if self.perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
             return hidden_states, residual
 
         return self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
+            hidden_states, residual, forward_batch, qaunt_format
         )
 
     def prepare_mlp(
