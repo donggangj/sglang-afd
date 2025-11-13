@@ -2819,6 +2819,8 @@ class DeepseekV2ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         afd_perspective = get_afd_perspective()
+        is_afd_ffn = afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN
+        is_afd_attn = afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN
 
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
@@ -2833,7 +2835,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_FFN:
+        if is_afd_ffn:
             stacked_params_mapping = []
         else:
             stacked_params_mapping = [
@@ -2842,7 +2844,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 ("gate_up_proj", "up_proj", 1),
             ]
 
-        if afd_perspective == AFDPerspective.AFD_PERSPECTIVE_ATTN:
+        if is_afd_attn:
             expert_params_mapping = []
         else:
             # Params for weights, fp8 weight scales, fp8 activation scales
@@ -2939,7 +2941,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     continue
                 for param_name, weight_name, shard_id in stacked_params_mapping:
                     # Skip non-stacked layers and experts (experts handled below).
-                    if weight_name not in name:
+                    if weight_name not in name or is_afd_attn:
                         continue
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
@@ -2962,7 +2964,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 else:
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
-                        if weight_name not in name:
+                        if weight_name not in name or is_afd_attn:
                             continue
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
@@ -2987,6 +2989,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                             continue
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
+                            continue
+                        if is_afd_ffn:
                             continue
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
