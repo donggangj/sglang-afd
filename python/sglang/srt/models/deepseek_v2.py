@@ -3073,7 +3073,9 @@ class DeepseekV2ForCausalLM(nn.Module):
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        if not is_afd_ffn:
+            # post process attention modules
+            self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
